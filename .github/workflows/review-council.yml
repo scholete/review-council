@@ -15,6 +15,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# Explicit token scopes — GITHUB_TOKEN is read-only by default otherwise
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
 concurrency:
   group: pr-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
