@@ -182,10 +182,16 @@ async def _review_single_pr(
     if stage3.get("response") is None:
         verdict = "❌ Error — no synthesis produced"
     else:
+        # Search the full response (not just first 500 chars) for verdict markers
         lower = stage3["response"].lower()
-        if "deny" in lower and "### verdict" in lower[:500]:
+        # Check for denial/changes markers first — Approve is the default
+        if "❌" in stage3["response"] and "deny" in lower:
             verdict = "❌ Denied"
-        elif "changes requested" in lower[:500]:
+        elif "⚠️" in stage3["response"] and "changes" in lower:
+            verdict = "⚠️ Changes Requested"
+        elif "deny" in lower:
+            verdict = "❌ Denied"
+        elif "changes requested" in lower:
             verdict = "⚠️ Changes Requested"
 
     review_body = f"""# Review Council — {owner}/{repo} #{pr_number}
