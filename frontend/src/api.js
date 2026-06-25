@@ -1,115 +1,86 @@
 /**
- * API client for the LLM Council backend.
+ * API client for the Review Council backend.
  */
 
 const API_BASE = 'http://localhost:8001';
 
 export const api = {
-  /**
-   * List all conversations.
-   */
-  async listConversations() {
-    const response = await fetch(`${API_BASE}/api/conversations`);
-    if (!response.ok) {
-      throw new Error('Failed to list conversations');
-    }
-    return response.json();
+  // ── Reviews ──────────────────────────────────────
+
+  async listReviews() {
+    const res = await fetch(`${API_BASE}/api/reviews`);
+    if (!res.ok) throw new Error('Failed to list reviews');
+    return res.json();
   },
 
-  /**
-   * Create a new conversation.
-   */
-  async createConversation() {
-    const response = await fetch(`${API_BASE}/api/conversations`, {
+  async getReview(id) {
+    const res = await fetch(`${API_BASE}/api/reviews/${id}`);
+    if (!res.ok) throw new Error('Failed to get review');
+    return res.json();
+  },
+
+  async deleteReview(id) {
+    const res = await fetch(`${API_BASE}/api/reviews/${id}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('Failed to delete review');
+    return res.json();
+  },
+
+  // ── Submit a raw diff ────────────────────────────
+
+  async submitDiff(diffText, repo = '', prTitle = '', prDescription = '') {
+    const res = await fetch(`${API_BASE}/api/review`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({}),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ diff_text: diffText, repo, pr_title: prTitle, pr_description: prDescription }),
     });
-    if (!response.ok) {
-      throw new Error('Failed to create conversation');
-    }
-    return response.json();
+    if (!res.ok) throw new Error('Failed to submit diff');
+    return res.json();
   },
 
-  /**
-   * Get a specific conversation.
-   */
-  async getConversation(conversationId) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}`
-    );
-    if (!response.ok) {
-      throw new Error('Failed to get conversation');
-    }
-    return response.json();
+  // ── Submit a GitHub PR ───────────────────────────
+
+  async submitPr(prUrl) {
+    const res = await fetch(`${API_BASE}/api/review/pr`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pr_url: prUrl }),
+    });
+    if (!res.ok) throw new Error('Failed to submit PR');
+    return res.json();
   },
 
-  /**
-   * Send a message in a conversation.
-   */
-  async sendMessage(conversationId, content) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}/message`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ content }),
-      }
-    );
-    if (!response.ok) {
-      throw new Error('Failed to send message');
-    }
-    return response.json();
-  },
+  // ── Streamed review ──────────────────────────────
 
-  /**
-   * Send a message and receive streaming updates.
-   * @param {string} conversationId - The conversation ID
-   * @param {string} content - The message content
-   * @param {function} onEvent - Callback function for each event: (eventType, data) => void
-   * @returns {Promise<void>}
-   */
-  async sendMessageStream(conversationId, content, onEvent) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}/message/stream`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ content }),
-      }
-    );
+  async submitDiffStream(diffText, repo = '', prTitle = '', prDescription = '', onEvent) {
+    const res = await fetch(`${API_BASE}/api/review/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ diff_text: diffText, repo, pr_title: prTitle, pr_description: prDescription }),
+    });
+    if (!res.ok) throw new Error('Failed to submit diff');
 
-    if (!response.ok) {
-      throw new Error('Failed to send message');
-    }
-
-    const reader = response.body.getReader();
+    const reader = res.body.getReader();
     const decoder = new TextDecoder();
-
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       const chunk = decoder.decode(value);
-      const lines = chunk.split('\n');
-
-      for (const line of lines) {
+      for (const line of chunk.split('\n')) {
         if (line.startsWith('data: ')) {
-          const data = line.slice(6);
           try {
-            const event = JSON.parse(data);
+            const event = JSON.parse(line.slice(6));
             onEvent(event.type, event);
-          } catch (e) {
-            console.error('Failed to parse SSE event:', e);
-          }
+          } catch { /* skip parse errors */ }
         }
       }
     }
+  },
+
+  // ── List open PRs ────────────────────────────────
+
+  async listOpenPrs() {
+    const res = await fetch(`${API_BASE}/api/prs`);
+    if (!res.ok) throw new Error('Failed to list PRs');
+    return res.json();
   },
 };

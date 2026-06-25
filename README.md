@@ -1,87 +1,105 @@
-# LLM Council
+# Review Council
 
-![llmcouncil](header.jpg)
+![review-council](header.jpg)
 
-The idea of this repo is that instead of asking a question to your favorite LLM provider (e.g. OpenAI GPT 5.1, Google Gemini 3.0 Pro, Anthropic Claude Sonnet 4.5, xAI Grok 4, eg.c), you can group them into your "LLM Council". This repo is a simple, local web app that essentially looks like ChatGPT except it uses OpenRouter to send your query to multiple LLMs, it then asks them to review and rank each other's work, and finally a Chairman LLM produces the final response.
+An LLM-powered **code review council** for Scholete's repositories. Runs as a **GitHub Action** on every PR — no servers to maintain, no MacBook required. Multiple LLMs independently review every PR, evaluate each other's reviews, and a chairman synthesises a final verdict posted back as a PR comment + commit status.
 
-In a bit more detail, here is what happens when you submit a query:
+## How It Works
 
-1. **Stage 1: First opinions**. The user query is given to all LLMs individually, and the responses are collected. The individual responses are shown in a "tab view", so that the user can inspect them all one by one.
-2. **Stage 2: Review**. Each individual LLM is given the responses of the other LLMs. Under the hood, the LLM identities are anonymized so that the LLM can't play favorites when judging their outputs. The LLM is asked to rank them in accuracy and insight.
-3. **Stage 3: Final response**. The designated Chairman of the LLM Council takes all of the model's responses and compiles them into a single final answer that is presented to the user.
+```
+PR opened / updated
+    ↓  (GitHub Action trigger)
+Stage 1: Two independent reviews (glm-5.2 + deepseek-v4-pro)
+    ↓
+Stage 2: Each model evaluates the other's review (anonymised meta-review)
+    ↓
+Stage 3: Chairman synthesises final consolidated review with verdict
+    ↓
+Result posted as PR comment + commit status check
+```
 
-## Vibe Code Alert
+### Stage 1: Individual Code Reviews
+Each council model independently reviews the diff across: correctness, security, code quality, architecture, performance, and testing. Per-repo rules are injected into the prompt (Pulse vs Stride vs Stride-GPU each have different conventions).
 
-This project was 99% vibe coded as a fun Saturday hack because I wanted to explore and evaluate a number of LLMs side by side in the process of [reading books together with LLMs](https://x.com/karpathy/status/1990577951671509438). It's nice and useful to see multiple responses side by side, and also the cross-opinions of all LLMs on each other's outputs. I'm not going to support it in any way, it's provided here as is for other people's inspiration and I don't intend to improve it. Code is ephemeral now and libraries are over, ask your LLM to change it in whatever way you like.
+### Stage 2: Meta-Review
+Reviews are anonymised as "Response A", "Response B", etc. Each model evaluates the other reviews — which was more thorough? Caught more issues? Gave better recommendations?
 
-## Setup
+### Stage 3: Final Synthesis
+The Chairman (glm-5.2) produces a consolidated, actionable review with priority levels and a verdict: ✅ Approve | ⚠️ Changes Requested | ❌ Deny
 
-### 1. Install Dependencies
+## One-Time Setup
 
-The project uses [uv](https://docs.astral.sh/uv/) for project management.
+### 1. Add Secrets to Each Scholete Repo
 
-**Backend:**
+For each repo you want the council to review (pulse, stride, stride-gpu, etc.):
+
+1. Go to `Settings → Secrets and variables → Actions`
+2. Add these **repository secrets** (not env vars):
+
+| Secret | Value |
+|--------|-------|
+| `NEURALWATT_API_KEY` | Your NeuralWatt API key |
+| `DEEPSEEK_API_KEY` | Your DeepSeek API key |
+
+That's it. `GITHUB_TOKEN` is auto-generated — no setup needed.
+
+### 2. Install the Workflow
+
+Copy the workflow into each Scholete repo:
+
 ```bash
+# For each repo:
+cp .github/workflows/review-council.yml /path/to/repo/.github/workflows/
+```
+
+Or better — add this repo as a reusable workflow and reference it. (Happy to set that up.)
+
+## What Happens on Every PR
+
+- Trigger: `opened`, `synchronize` (new commit), `reopened`
+- The Action runs `review.py` which:
+  1. Fetches the PR diff via the GitHub API
+  2. Runs all 3 stages against NeuralWatt + DeepSeek
+  3. Posts a consolidated review comment on the PR
+  4. Sets a commit status check (success/failure)
+- Newer commits on the same PR cancel any in-progress review
+
+## Repository-Specific Rules
+
+The council knows about each Scholete repo's conventions:
+
+- **Pulse** — Python/FastAPI, PHI data privacy, OCR pipelines
+- **Stride** — Node.js/TypeScript, student data, gamification config
+- **Stride-GPU** — Python/MLX, GPU memory management
+- **Scholete Website** — React/TypeScript, SEO, analytics
+- **AgenticWhales** — Python agent orchestration
+
+Rules are in `backend/rules/__init__.py` and injected into Stage 1 prompts.
+
+## Local Dev (Optional)
+
+The frontend + FastAPI backend still work for interactive testing of prompts and debugging:
+
+```bash
+cp .env.example .env    # fill in NEURALWATT_API_KEY + DEEPSEEK_API_KEY
 uv sync
-```
-
-**Frontend:**
-```bash
-cd frontend
-npm install
-cd ..
-```
-
-### 2. Configure API Key
-
-Create a `.env` file in the project root:
-
-```bash
-OPENROUTER_API_KEY=sk-or-v1-...
-```
-
-Get your API key at [openrouter.ai](https://openrouter.ai/). Make sure to purchase the credits you need, or sign up for automatic top up.
-
-### 3. Configure Models (Optional)
-
-Edit `backend/config.py` to customize the council:
-
-```python
-COUNCIL_MODELS = [
-    "openai/gpt-5.1",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
-]
-
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
-```
-
-## Running the Application
-
-**Option 1: Use the start script**
-```bash
+cd frontend && npm install && cd ..
 ./start.sh
+# Opens at http://localhost:5173
 ```
 
-**Option 2: Run manually**
+This is not needed for production — the Action handles everything.
 
-Terminal 1 (Backend):
-```bash
-uv run python -m backend.main
-```
+## Providers
 
-Terminal 2 (Frontend):
-```bash
-cd frontend
-npm run dev
-```
-
-Then open http://localhost:5173 in your browser.
+| Model | Provider | Role |
+|-------|----------|------|
+| `glm-5.2` | NeuralWatt | Council member + Chairman |
+| `deepseek-v4-pro` | DeepSeek | Council member |
 
 ## Tech Stack
 
-- **Backend:** FastAPI (Python 3.10+), async httpx, OpenRouter API
-- **Frontend:** React + Vite, react-markdown for rendering
-- **Storage:** JSON files in `data/conversations/`
-- **Package Management:** uv for Python, npm for JavaScript
+- **Runtime:** GitHub Actions (Ubuntu), reviewed by Python
+- **Dependencies:** httpx, python-dotenv (everything else is stdlib)
+- **Models:** NeuralWatt + DeepSeek APIs (OpenAI-compatible)
+- **Repo:** monorepo for the council logic; workflow file gets copied to each Scholete repo

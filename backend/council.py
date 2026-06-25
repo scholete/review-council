@@ -1,335 +1,380 @@
-"""3-stage LLM Council orchestration."""
+"""3-stage Review Council orchestration for code review.
+
+Stage 1 — Each council model independently reviews the code diff.
+Stage 2 — Each model evaluates the anonymised reviews (meta-review).
+Stage 3 — Chairman synthesises a final consolidated review.
+"""
 
 from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from .llm_client import query_models_parallel, query_model
+from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, TITLE_MODEL
 
 
-async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
-    """
-    Stage 1: Collect individual responses from all council models.
+# ── Helpers ─────────────────────────────────────────────────────────
+
+def _format_diff_for_prompt(diff_text: str, repo: str = "", pr_title: str = "") -> str:
+    """Wrap a raw diff into a readable block prefixed with context."""
+    parts = []
+    if repo:
+        parts.append(f"Repository: {repo}")
+    if pr_title:
+        parts.append(f"PR Title: {pr_title}")
+    parts.append("```diff")
+    parts.append(diff_text)
+    parts.append("```")
+    return "\n".join(parts)
+
+
+# ── Stage 1: Individual Code Reviews ────────────────────────────────
+
+async def stage1_collect_reviews(
+    diff_text: str,
+    *,
+    repo: str = "",
+    pr_title: str = "",
+    pr_description: str = "",
+) -> List[Dict[str, Any]]:
+    """Stage 1 — each council model independently reviews the diff.
 
     Args:
-        user_query: The user's question
+        diff_text:      Unified diff text.
+        repo:           Repository name (e.g. "pulse").
+        pr_title:       Title of the pull request.
+        pr_description: Description / body of the pull request.
 
     Returns:
-        List of dicts with 'model' and 'response' keys
+        List of ``{"model", "response", "provider"}`` dicts.
     """
-    messages = [{"role": "user", "content": user_query}]
+    formatted_diff = _format_diff_for_prompt(diff_text, repo, pr_title)
 
-    # Query all models in parallel
+    review_prompt = f"""You are a senior engineer performing a thorough code review.
+
+Context:
+{"  Repository: " + repo if repo else ""}
+{"  PR Title: " + pr_title if pr_title else ""}
+{"  PR Description: " + pr_description if pr_description else ""}
+
+Below is the code diff to review:
+
+{formatted_diff}
+
+Please provide a structured review covering these areas:
+
+1. **Summary** — What does this change do in a sentence?
+2. **Correctness** — Any bugs, logic errors, or edge cases missed?
+3. **Security** — Injection risks, data leaks, auth/authorisation issues?
+4. **Code Quality** — Readability, maintainability, follows language/framework conventions?
+5. **Architecture** — Coupling, separation of concerns, API design?
+6. **Performance** — N+1 queries, unnecessary allocations, caching opportunities?
+7. **Testing** — Are tests included? What scenarios are missing?
+8. **Nitpicks** — Minor style issues, naming, comments.
+
+For every issue found, include the **file path** and **line number**.
+Be specific and actionable — "this is wrong" is less useful than "this will crash when X is empty".
+
+End with a **verdict**: ✅ Approve | ⚠️ Changes Requested | ❌ Deny"""
+
+    messages = [{"role": "user", "content": review_prompt}]
+
     responses = await query_models_parallel(COUNCIL_MODELS, messages)
 
-    # Format results
     stage1_results = []
-    for model, response in responses.items():
-        if response is not None:  # Only include successful responses
+    for cfg in COUNCIL_MODELS:
+        model_name = cfg["model"]
+        resp = responses.get(model_name)
+        if resp is not None:
             stage1_results.append({
-                "model": model,
-                "response": response.get('content', '')
+                "model": model_name,
+                "provider": cfg["provider"],
+                "response": resp.get("content", ""),
             })
 
     return stage1_results
 
 
+# ── Stage 2: Meta-Review (Anonymised Peer Evaluation) ──────────────
+
 async def stage2_collect_rankings(
-    user_query: str,
-    stage1_results: List[Dict[str, Any]]
+    diff_text: str,
+    stage1_results: List[Dict[str, Any]],
+    *,
+    repo: str = "",
+    pr_title: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-    """
-    Stage 2: Each model ranks the anonymized responses.
+    """Stage 2 — each model evaluates the anonymised reviews.
 
     Args:
-        user_query: The original user query
-        stage1_results: Results from Stage 1
+        diff_text:      Original diff (for context).
+        stage1_results: Results from Stage 1.
+        repo:           Repository name.
+        pr_title:       PR title.
 
     Returns:
-        Tuple of (rankings list, label_to_model mapping)
+        ``(stage2_results, label_to_model)`` tuple.
     """
-    # Create anonymized labels for responses (Response A, Response B, etc.)
-    labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
-
-    # Create mapping from label to model name
+    # Anonymise: Response A, Response B, ...
+    labels = [chr(65 + i) for i in range(len(stage1_results))]
     label_to_model = {
-        f"Response {label}": result['model']
-        for label, result in zip(labels, stage1_results)
+        f"Response {label}": f"{r['provider']}/{r['model']}"
+        for label, r in zip(labels, stage1_results)
     }
 
-    # Build the ranking prompt
-    responses_text = "\n\n".join([
-        f"Response {label}:\n{result['response']}"
-        for label, result in zip(labels, stage1_results)
+    formatted_diff = _format_diff_for_prompt(diff_text, repo, pr_title)
+
+    reviews_text = "\n\n".join([
+        f"Response {label}:\n{r['response']}"
+        for label, r in zip(labels, stage1_results)
     ])
 
-    ranking_prompt = f"""You are evaluating different responses to the following question:
+    meta_prompt = f"""You are evaluating code reviews (not code). Below is a code diff followed by several anonymised reviews of it.
 
-Question: {user_query}
+Code Diff:
+{formatted_diff}
 
-Here are the responses from different models (anonymized):
-
-{responses_text}
+Reviews (anonymised):
+{reviews_text}
 
 Your task:
-1. First, evaluate each response individually. For each response, explain what it does well and what it does poorly.
-2. Then, at the very end of your response, provide a final ranking.
+1. Evaluate each review individually. Which one caught the most issues? Which one was most thorough? Which gave the most actionable feedback?
+2. At the very end of your response provide a final ranking.
 
-IMPORTANT: Your final ranking MUST be formatted EXACTLY as follows:
-- Start with the line "FINAL RANKING:" (all caps, with colon)
-- Then list the responses from best to worst as a numbered list
-- Each line should be: number, period, space, then ONLY the response label (e.g., "1. Response A")
-- Do not add any other text or explanations in the ranking section
+IMPORTANT format for the ranking:
+- Start with the line "FINAL RANKING:" (all caps, colon).
+- Then list the responses from best to worst as a numbered list.
+- Each line: number, period, space, then ONLY "Response X".
+- No extra text after the ranking section.
 
-Example of the correct format for your ENTIRE response:
-
-Response A provides good detail on X but misses Y...
-Response B is accurate but lacks depth on Z...
-Response C offers the most comprehensive answer...
-
+Example:
 FINAL RANKING:
 1. Response C
 2. Response A
 3. Response B
 
-Now provide your evaluation and ranking:"""
+Now provide your evaluation and ranking."""
 
-    messages = [{"role": "user", "content": ranking_prompt}]
+    messages = [{"role": "user", "content": meta_prompt}]
 
-    # Get rankings from all council models in parallel
     responses = await query_models_parallel(COUNCIL_MODELS, messages)
 
-    # Format results
     stage2_results = []
-    for model, response in responses.items():
-        if response is not None:
-            full_text = response.get('content', '')
+    for cfg in COUNCIL_MODELS:
+        model_name = cfg["model"]
+        resp = responses.get(model_name)
+        if resp is not None:
+            full_text = resp.get("content", "")
             parsed = parse_ranking_from_text(full_text)
             stage2_results.append({
-                "model": model,
+                "model": model_name,
+                "provider": cfg["provider"],
                 "ranking": full_text,
-                "parsed_ranking": parsed
+                "parsed_ranking": parsed,
             })
 
     return stage2_results, label_to_model
 
 
+# ── Stage 3: Chairman Synthesis ─────────────────────────────────────
+
 async def stage3_synthesize_final(
-    user_query: str,
+    diff_text: str,
     stage1_results: List[Dict[str, Any]],
-    stage2_results: List[Dict[str, Any]]
+    stage2_results: List[Dict[str, Any]],
+    *,
+    repo: str = "",
+    pr_title: str = "",
 ) -> Dict[str, Any]:
-    """
-    Stage 3: Chairman synthesizes final response.
+    """Stage 3 — Chairman produces a single consolidated review.
 
     Args:
-        user_query: The original user query
-        stage1_results: Individual model responses from Stage 1
-        stage2_results: Rankings from Stage 2
+        diff_text:      Original diff.
+        stage1_results: Individual reviews.
+        stage2_results: Peer evaluations.
+        repo:           Repository name.
+        pr_title:       PR title.
 
     Returns:
-        Dict with 'model' and 'response' keys
+        ``{"model", "provider", "response"}``
     """
-    # Build comprehensive context for chairman
+    formatted_diff = _format_diff_for_prompt(diff_text, repo, pr_title)
+
     stage1_text = "\n\n".join([
-        f"Model: {result['model']}\nResponse: {result['response']}"
-        for result in stage1_results
+        f"Reviewer: {r['provider']}/{r['model']}\n{r['response']}"
+        for r in stage1_results
     ])
 
     stage2_text = "\n\n".join([
-        f"Model: {result['model']}\nRanking: {result['ranking']}"
-        for result in stage2_results
+        f"Evaluator: {r['provider']}/{r['model']}\n{r['ranking']}"
+        for r in stage2_results
     ])
 
-    chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
+    chairman_prompt = f"""You are the Chairman of a Review Council. Multiple AI models have reviewed a code diff and then evaluated each other's reviews.
 
-Original Question: {user_query}
+{"Repository: " + repo if repo else ""}
+{"PR Title: " + pr_title if pr_title else ""}
 
-STAGE 1 - Individual Responses:
+Code Diff:
+{formatted_diff}
+
+STAGE 1 — Individual Reviews:
 {stage1_text}
 
-STAGE 2 - Peer Rankings:
+STAGE 2 — Peer Evaluations of Reviews:
 {stage2_text}
 
-Your task as Chairman is to synthesize all of this information into a single, comprehensive, accurate answer to the user's original question. Consider:
-- The individual responses and their insights
-- The peer rankings and what they reveal about response quality
-- Any patterns of agreement or disagreement
+Your task as Chairman is to synthesise all of this into a **single, consolidated, actionable code review**. Consider:
 
-Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
+- The issues caught by each reviewer and their severity
+- The peer evaluations — which reviews were most thorough
+- Areas of agreement (high-confidence issues) vs disagreement
+- Anything important that ALL reviewers missed
+
+Format your final review as:
+
+## Summary
+(one-paragraph overview)
+
+## Critical Issues
+(file:line — description)
+
+## High Priority
+(file:line — description)
+
+## Medium / Low
+(file:line — description)
+
+## Positive Highlights
+(what the PR does well)
+
+## Verdict
+✅ Approve | ⚠️ Changes Requested | ❌ Deny"""
 
     messages = [{"role": "user", "content": chairman_prompt}]
 
-    # Query the chairman model
     response = await query_model(CHAIRMAN_MODEL, messages)
-
     if response is None:
-        # Fallback if chairman fails
         return {
-            "model": CHAIRMAN_MODEL,
-            "response": "Error: Unable to generate final synthesis."
+            "model": CHAIRMAN_MODEL["model"],
+            "provider": CHAIRMAN_MODEL["provider"],
+            "response": "Error: Unable to generate final synthesis.",
         }
 
     return {
-        "model": CHAIRMAN_MODEL,
-        "response": response.get('content', '')
+        "model": CHAIRMAN_MODEL["model"],
+        "provider": CHAIRMAN_MODEL["provider"],
+        "response": response.get("content", ""),
     }
 
 
+# ── Ranking Parser ─────────────────────────────────────────────────
+
 def parse_ranking_from_text(ranking_text: str) -> List[str]:
-    """
-    Parse the FINAL RANKING section from the model's response.
-
-    Args:
-        ranking_text: The full text response from the model
-
-    Returns:
-        List of response labels in ranked order
-    """
+    """Extract ``["Response C", "Response A", ...]`` from a model's output."""
     import re
 
-    # Look for "FINAL RANKING:" section
     if "FINAL RANKING:" in ranking_text:
-        # Extract everything after "FINAL RANKING:"
         parts = ranking_text.split("FINAL RANKING:")
         if len(parts) >= 2:
-            ranking_section = parts[1]
-            # Try to extract numbered list format (e.g., "1. Response A")
-            # This pattern looks for: number, period, optional space, "Response X"
-            numbered_matches = re.findall(r'\d+\.\s*Response [A-Z]', ranking_section)
-            if numbered_matches:
-                # Extract just the "Response X" part
-                return [re.search(r'Response [A-Z]', m).group() for m in numbered_matches]
+            section = parts[1]
+            # Match lines like "1. Response C" and extract "Response C"
+            numbered = re.findall(r"\d+\.\s*(Response [A-Z])", section)
+            if numbered:
+                return numbered
+            # Fallback: just "Response X" patterns in order
+            return re.findall(r"Response [A-Z]", section)
 
-            # Fallback: Extract all "Response X" patterns in order
-            matches = re.findall(r'Response [A-Z]', ranking_section)
-            return matches
+    return re.findall(r"Response [A-Z]", ranking_text)
 
-    # Fallback: try to find any "Response X" patterns in order
-    matches = re.findall(r'Response [A-Z]', ranking_text)
-    return matches
 
+# ── Aggregate Rankings ─────────────────────────────────────────────
 
 def calculate_aggregate_rankings(
     stage2_results: List[Dict[str, Any]],
-    label_to_model: Dict[str, str]
+    label_to_model: Dict[str, str],
 ) -> List[Dict[str, Any]]:
-    """
-    Calculate aggregate rankings across all models.
-
-    Args:
-        stage2_results: Rankings from each model
-        label_to_model: Mapping from anonymous labels to model names
-
-    Returns:
-        List of dicts with model name and average rank, sorted best to worst
-    """
+    """Average rank position per reviewer, sorted best to worst."""
     from collections import defaultdict
 
-    # Track positions for each model
-    model_positions = defaultdict(list)
+    positions = defaultdict(list)
 
-    for ranking in stage2_results:
-        ranking_text = ranking['ranking']
-
-        # Parse the ranking from the structured format
-        parsed_ranking = parse_ranking_from_text(ranking_text)
-
-        for position, label in enumerate(parsed_ranking, start=1):
+    for r in stage2_results:
+        parsed = parse_ranking_from_text(r["ranking"])
+        for pos, label in enumerate(parsed, start=1):
             if label in label_to_model:
-                model_name = label_to_model[label]
-                model_positions[model_name].append(position)
+                positions[label_to_model[label]].append(pos)
 
-    # Calculate average position for each model
     aggregate = []
-    for model, positions in model_positions.items():
-        if positions:
-            avg_rank = sum(positions) / len(positions)
+    for reviewer, pos_list in positions.items():
+        if pos_list:
             aggregate.append({
-                "model": model,
-                "average_rank": round(avg_rank, 2),
-                "rankings_count": len(positions)
+                "reviewer": reviewer,
+                "average_rank": round(sum(pos_list) / len(pos_list), 2),
+                "rankings_count": len(pos_list),
             })
 
-    # Sort by average rank (lower is better)
-    aggregate.sort(key=lambda x: x['average_rank'])
-
+    aggregate.sort(key=lambda x: x["average_rank"])
     return aggregate
 
 
-async def generate_conversation_title(user_query: str) -> str:
-    """
-    Generate a short title for a conversation based on the first user message.
+# ── Title Generation ───────────────────────────────────────────────
 
-    Args:
-        user_query: The first user message
-
-    Returns:
-        A short title (3-5 words)
-    """
-    title_prompt = f"""Generate a very short title (3-5 words maximum) that summarizes the following question.
-The title should be concise and descriptive. Do not use quotes or punctuation in the title.
-
-Question: {user_query}
+async def generate_review_title(
+    pr_title: str,
+    repo: str = "",
+) -> str:
+    """Derive a short title for a code review."""
+    context = f"Repository: {repo}\n" if repo else ""
+    prompt = f"""{context}Generate a very short title (3-6 words) summarising this pull request review:
+PR Title: {pr_title}
 
 Title:"""
-
-    messages = [{"role": "user", "content": title_prompt}]
-
-    # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
-
+    messages = [{"role": "user", "content": prompt}]
+    response = await query_model(TITLE_MODEL, messages, timeout=30.0)
     if response is None:
-        # Fallback to a generic title
-        return "New Conversation"
-
-    title = response.get('content', 'New Conversation').strip()
-
-    # Clean up the title - remove quotes, limit length
-    title = title.strip('"\'')
-
-    # Truncate if too long
-    if len(title) > 50:
-        title = title[:47] + "..."
-
-    return title
+        return "Code Review"
+    title = response.get("content", "Code Review").strip().strip("\"'")
+    return title[:50] if len(title) <= 50 else title[:47] + "..."
 
 
-async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
-    """
-    Run the complete 3-stage council process.
+# ── Full Pipeline ───────────────────────────────────────────────────
 
-    Args:
-        user_query: The user's question
+async def run_full_review(
+    diff_text: str,
+    *,
+    repo: str = "",
+    pr_title: str = "",
+    pr_description: str = "",
+) -> Tuple[List, List, Dict, Dict]:
+    """Run the complete 3-stage review council.
 
     Returns:
-        Tuple of (stage1_results, stage2_results, stage3_result, metadata)
+        ``(stage1_results, stage2_results, stage3_result, metadata)``
     """
-    # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query)
-
-    # If no models responded successfully, return error
+    # Stage 1
+    stage1_results = await stage1_collect_reviews(
+        diff_text, repo=repo, pr_title=pr_title, pr_description=pr_description,
+    )
     if not stage1_results:
         return [], [], {
             "model": "error",
-            "response": "All models failed to respond. Please try again."
+            "response": "All models failed to respond. Check API keys and try again.",
         }, {}
 
-    # Stage 2: Collect rankings
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
-
-    # Calculate aggregate rankings
-    aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-
-    # Stage 3: Synthesize final answer
-    stage3_result = await stage3_synthesize_final(
-        user_query,
-        stage1_results,
-        stage2_results
+    # Stage 2
+    stage2_results, label_to_model = await stage2_collect_rankings(
+        diff_text, stage1_results, repo=repo, pr_title=pr_title,
     )
 
-    # Prepare metadata
+    aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+
+    # Stage 3
+    stage3_result = await stage3_synthesize_final(
+        diff_text, stage1_results, stage2_results,
+        repo=repo, pr_title=pr_title,
+    )
+
     metadata = {
         "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings
+        "aggregate_rankings": aggregate_rankings,
     }
 
     return stage1_results, stage2_results, stage3_result, metadata

@@ -1,26 +1,48 @@
-"""Configuration for the LLM Council."""
+"""Configuration for the Review Council."""
 
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# OpenRouter API key
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# ── Providers ──────────────────────────────────────────────────────
+# Each provider has an API key and a base URL (OpenAI-compatible).
 
-# Council members - list of OpenRouter model identifiers
+PROVIDER_CONFIGS = {
+    "neuralwatt": {
+        "api_key": os.getenv("NEURALWATT_API_KEY"),
+        "base_url": "https://api.neuralwatt.com/v1",
+    },
+    "deepseek": {
+        "api_key": os.getenv("DEEPSEEK_API_KEY"),
+        "base_url": "https://api.deepseek.com",
+    },
+}
+
+# ── Council members ────────────────────────────────────────────────
+# Each entry specifies the provider and the model identifier to use.
+
 COUNCIL_MODELS = [
-    "openai/gpt-5.1",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
+    {"provider": "neuralwatt", "model": "glm-5.2"},
+    {"provider": "deepseek", "model": "deepseek-v4-pro"},
 ]
 
-# Chairman model - synthesizes final response
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
+# Chairman — synthesises the final review from stage 1 & 2 outputs.
+CHAIRMAN_MODEL = {"provider": "neuralwatt", "model": "glm-5.2"}
 
-# OpenRouter API endpoint
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+# ── GitHub Integration ─────────────────────────────────────────────
 
-# Data directory for conversation storage
-DATA_DIR = "data/conversations"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+MONITORED_REPOS = [
+    repo.strip()
+    for repo in os.getenv("MONITORED_REPOS", "").split(",")
+    if repo.strip()
+]
+
+# ── Data Storage ───────────────────────────────────────────────────
+
+DATA_DIR = os.getenv("DATA_DIR", "data/reviews")
+
+# ── Title generation model (fast + cheap) ─────────────────────────
+
+TITLE_MODEL = {"provider": "deepseek", "model": "deepseek-v4-pro"}

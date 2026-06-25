@@ -1,198 +1,412 @@
-"""FastAPI backend for LLM Council."""
+"""FastAPI backend for the Review Council.
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import List, Dict, Any
+Endpoints for submitting diffs, reviewing GitHub PRs, receiving
+webhooks, and browsing past reviews.
+"""
+
 import uuid
 import json
 import asyncio
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from .council import (
+    run_full_review,
+    generate_review_title,
+    stage1_collect_reviews,
+    stage2_collect_rankings,
+    stage3_synthesize_final,
+    calculate_aggregate_rankings,
+)
+from .github_integration import (
+    parse_pr_url,
+    fetch_pr_diff,
+    post_pr_review,
+    set_commit_status,
+    parse_webhook_payload,
+    extract_pr_info_from_webhook,
+    list_open_prs,
+)
+from .diff_analyzer import diff_summary
 
-app = FastAPI(title="LLM Council API")
+app = FastAPI(title="Review Council API")
 
-# Enable CORS for local development
+# CORS for local frontend dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-class CreateConversationRequest(BaseModel):
-    """Request to create a new conversation."""
-    pass
+# ── Models ──────────────────────────────────────────────────────────
+
+class SubmitDiffRequest(BaseModel):
+    diff_text: str
+    repo: str = ""
+    pr_title: str = ""
+    pr_description: str = ""
 
 
-class SendMessageRequest(BaseModel):
-    """Request to send a message in a conversation."""
-    content: str
+class SubmitPRRequest(BaseModel):
+    pr_url: str
 
 
-class ConversationMetadata(BaseModel):
-    """Conversation metadata for list view."""
+class ReviewMetadata(BaseModel):
     id: str
     created_at: str
     title: str
+    status: str
+    repo: str = ""
+    pr_number: Optional[int] = None
+    pr_title: str = ""
     message_count: int
 
 
-class Conversation(BaseModel):
-    """Full conversation with all messages."""
+class ReviewDetail(BaseModel):
     id: str
     created_at: str
     title: str
+    status: str
+    pr: Dict[str, Any]
+    diff_text: str
     messages: List[Dict[str, Any]]
 
 
+# ── Endpoints ───────────────────────────────────────────────────────
+
 @app.get("/")
 async def root():
-    """Health check endpoint."""
-    return {"status": "ok", "service": "LLM Council API"}
+    return {"status": "ok", "service": "Review Council API"}
 
 
-@app.get("/api/conversations", response_model=List[ConversationMetadata])
-async def list_conversations():
-    """List all conversations (metadata only)."""
-    return storage.list_conversations()
+# ── List / Create / Get / Delete reviews ───────────────────────────
+
+@app.get("/api/reviews", response_model=List[ReviewMetadata])
+async def list_reviews():
+    return storage.list_reviews()
 
 
-@app.post("/api/conversations", response_model=Conversation)
-async def create_conversation(request: CreateConversationRequest):
-    """Create a new conversation."""
-    conversation_id = str(uuid.uuid4())
-    conversation = storage.create_conversation(conversation_id)
-    return conversation
+@app.get("/api/reviews/{review_id}", response_model=ReviewDetail)
+async def get_review(review_id: str):
+    review = storage.get_review(review_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+    return review
 
 
-@app.get("/api/conversations/{conversation_id}", response_model=Conversation)
-async def get_conversation(conversation_id: str):
-    """Get a specific conversation with all its messages."""
-    conversation = storage.get_conversation(conversation_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return conversation
+@app.delete("/api/reviews/{review_id}")
+async def delete_review(review_id: str):
+    if not storage.delete_review(review_id):
+        raise HTTPException(status_code=404, detail="Review not found")
+    return {"status": "deleted"}
 
 
-@app.post("/api/conversations/{conversation_id}/message")
-async def send_message(conversation_id: str, request: SendMessageRequest):
-    """
-    Send a message and run the 3-stage council process.
-    Returns the complete response with all stages.
-    """
-    # Check if conversation exists
-    conversation = storage.get_conversation(conversation_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+# ── Submit a raw diff for review ────────────────────────────────────
 
-    # Check if this is the first message
-    is_first_message = len(conversation["messages"]) == 0
+@app.post("/api/review")
+async def submit_diff(request: SubmitDiffRequest):
+    """Submit a raw diff for council review."""
+    review_id = str(uuid.uuid4())
+    review = storage.create_review(review_id, pr_info={
+        "repo": request.repo,
+        "title": request.pr_title or diff_summary(request.diff_text),
+        "diff_summary": diff_summary(request.diff_text),
+    })
 
-    # Add user message
-    storage.add_user_message(conversation_id, request.content)
+    if request.repo:
+        title = await generate_review_title(
+            request.pr_title or diff_summary(request.diff_text),
+            repo=request.repo,
+        )
+        storage.update_review(review_id, title=title)
 
-    # If this is the first message, generate a title
-    if is_first_message:
-        title = await generate_conversation_title(request.content)
-        storage.update_conversation_title(conversation_id, title)
+    storage.add_user_message(review_id, f"Review diff for {request.repo or 'unknown'}")
 
-    # Run the 3-stage council process
-    stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
+    stage1, stage2, stage3, metadata = await run_full_review(
+        request.diff_text,
+        repo=request.repo,
+        pr_title=request.pr_title,
+        pr_description=request.pr_description,
     )
 
-    # Add assistant message with all stages
-    storage.add_assistant_message(
-        conversation_id,
-        stage1_results,
-        stage2_results,
-        stage3_result
-    )
+    storage.add_review_result(review_id, request.diff_text, stage1, stage2, stage3)
 
-    # Return the complete response with metadata
     return {
-        "stage1": stage1_results,
-        "stage2": stage2_results,
-        "stage3": stage3_result,
-        "metadata": metadata
+        "review_id": review_id,
+        "stage1": stage1,
+        "stage2": stage2,
+        "stage3": stage3,
+        "metadata": metadata,
     }
 
 
-@app.post("/api/conversations/{conversation_id}/message/stream")
-async def send_message_stream(conversation_id: str, request: SendMessageRequest):
-    """
-    Send a message and stream the 3-stage council process.
-    Returns Server-Sent Events as each stage completes.
-    """
-    # Check if conversation exists
-    conversation = storage.get_conversation(conversation_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+# ── Submit a GitHub PR for review ──────────────────────────────────
 
-    # Check if this is the first message
-    is_first_message = len(conversation["messages"]) == 0
+@app.post("/api/review/pr")
+async def submit_pr(request: SubmitPRRequest):
+    """Fetch a GitHub PR diff and submit for council review."""
+    parsed = parse_pr_url(request.pr_url)
+    if parsed is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid PR URL. Use format: https://github.com/owner/repo/pull/42 or owner/repo#42",
+        )
 
-    async def event_generator():
-        try:
-            # Add user message
-            storage.add_user_message(conversation_id, request.content)
+    owner, repo_name, pr_number = parsed
 
-            # Start title generation in parallel (don't await yet)
-            title_task = None
-            if is_first_message:
-                title_task = asyncio.create_task(generate_conversation_title(request.content))
+    pr_data = await fetch_pr_diff(owner, repo_name, pr_number)
+    if pr_data is None:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch PR from GitHub. Check that the repo and PR exist, and GITHUB_TOKEN is set.",
+        )
 
-            # Stage 1: Collect responses
-            yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
-            yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
+    review_id = str(uuid.uuid4())
+    storage.create_review(review_id, pr_info={
+        "owner": owner,
+        "repo": repo_name,
+        "pr_number": pr_number,
+        "title": pr_data["title"],
+        "sha": pr_data["sha"],
+        "author": pr_data["author"],
+    })
 
-            # Stage 2: Collect rankings
-            yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
-            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
+    # Set commit status to pending
+    if pr_data["sha"]:
+        await set_commit_status(
+            owner, repo_name, pr_data["sha"],
+            state="pending",
+            description="Review Council is analysing this PR...",
+        )
 
-            # Stage 3: Synthesize final answer
-            yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
-            yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
+    # Run the review
+    storage.add_user_message(review_id, f"Review PR #{pr_number} in {owner}/{repo_name}")
 
-            # Wait for title generation if it was started
-            if title_task:
-                title = await title_task
-                storage.update_conversation_title(conversation_id, title)
-                yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
+    stage1, stage2, stage3, metadata = await run_full_review(
+        pr_data["diff_text"],
+        repo=repo_name,
+        pr_title=pr_data["title"],
+        pr_description=pr_data["description"],
+    )
 
-            # Save complete assistant message
-            storage.add_assistant_message(
-                conversation_id,
-                stage1_results,
-                stage2_results,
-                stage3_result
+    storage.add_review_result(review_id, pr_data["diff_text"], stage1, stage2, stage3)
+    if pr_data["title"]:
+        storage.update_review(review_id, title=f"PR #{pr_number}: {pr_data['title'][:50]}")
+
+    # Post review back to GitHub
+    verdict = "✅ Approved"
+    if stage3["response"] and "deny" in stage3["response"].lower():
+        verdict = "❌ Changes Requested"
+    elif stage3["response"] and "changes requested" in stage3["response"].lower():
+        verdict = "⚠️ Changes Requested"
+
+    review_body = f"""# Review Council — PR #{pr_number}
+
+{verdict}
+
+---
+
+{stage3['response']}
+"""
+    await post_pr_review(owner, repo_name, pr_number, review_body)
+
+    # Update commit status
+    if pr_data["sha"]:
+        if stage3["response"] and "deny" in stage3["response"].split("\n")[0].lower():
+            await set_commit_status(
+                owner, repo_name, pr_data["sha"],
+                state="failure",
+                description="Review Council: changes requested",
+            )
+        else:
+            await set_commit_status(
+                owner, repo_name, pr_data["sha"],
+                state="success",
+                description="Review Council: review complete",
             )
 
-            # Send completion event
-            yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+    return {
+        "review_id": review_id,
+        "pr": {
+            "owner": owner,
+            "repo": repo_name,
+            "number": pr_number,
+            "title": pr_data["title"],
+        },
+        "stage1": stage1,
+        "stage2": stage2,
+        "stage3": stage3,
+        "metadata": metadata,
+    }
 
-        except Exception as e:
-            # Send error event
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+# ── Streamed version (supports larger diffs with progress) ─────────
+
+@app.post("/api/review/stream")
+async def submit_diff_stream(request: SubmitDiffRequest):
+    """Submit a diff and stream the 3-stage review as SSE events."""
+
+    async def event_generator():
+        review_id = str(uuid.uuid4())
+        storage.create_review(review_id, pr_info={
+            "repo": request.repo,
+            "title": request.pr_title or diff_summary(request.diff_text),
+        })
+        storage.add_user_message(review_id, f"Review diff for {request.repo or 'unknown'}")
+
+        yield f"data: {json.dumps({'type': 'review_created', 'review_id': review_id})}\n\n"
+
+        # Stage 1
+        yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
+        stage1 = await stage1_collect_reviews(
+            request.diff_text,
+            repo=request.repo,
+            pr_title=request.pr_title,
+            pr_description=request.pr_description,
+        )
+        yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1})}\n\n"
+
+        if not stage1:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'All models failed'})}\n\n"
+            return
+
+        # Stage 2
+        yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
+        stage2, label_to_model = await stage2_collect_rankings(
+            request.diff_text, stage1, repo=request.repo, pr_title=request.pr_title,
+        )
+        aggregate = calculate_aggregate_rankings(stage2, label_to_model)
+        yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate}})}\n\n"
+
+        # Stage 3
+        yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
+        stage3 = await stage3_synthesize_final(
+            request.diff_text, stage1, stage2,
+            repo=request.repo, pr_title=request.pr_title,
+        )
+        yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3})}\n\n"
+
+        # Save
+        storage.add_review_result(review_id, request.diff_text, stage1, stage2, stage3)
+        yield f"data: {json.dumps({'type': 'complete', 'review_id': review_id})}\n\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
 
+
+# ── Webhook: auto-review new PRs ────────────────────────────────────
+
+@app.post("/webhooks/github")
+async def github_webhook(request: Request):
+    """Receive GitHub webhook events for automatic PR review."""
+    body = await request.body()
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+
+    payload = parse_webhook_payload(body, sig, secret)
+    if payload is None and secret:
+        raise HTTPException(status_code=403, detail="Signature mismatch")
+
+    # Skip validation if no secret configured (development mode)
+    if payload is None:
+        payload = json.loads(body)
+
+    event = request.headers.get("X-GitHub-Event", "")
+
+    if event == "ping":
+        return {"status": "pong"}
+
+    if event != "pull_request":
+        return {"status": "ignored", "reason": f"unsupported event: {event}"}
+
+    pr_info = extract_pr_info_from_webhook(payload)
+    if pr_info is None:
+        return {"status": "ignored", "reason": "action or repo not monitored"}
+
+    # Fire-and-forget: trigger a review in the background
+    asyncio.create_task(_auto_review(pr_info))
+
+    return {"status": "accepted", "pr": f"{pr_info['owner']}/{pr_info['repo']}#{pr_info['pr_number']}"}
+
+
+async def _auto_review(pr_info: dict):
+    """Background task for auto-reviewing a PR."""
+    pr_data = await fetch_pr_diff(
+        pr_info["owner"], pr_info["repo"], pr_info["pr_number"],
+    )
+    if pr_data is None:
+        return
+
+    review_id = str(uuid.uuid4())
+    storage.create_review(review_id, pr_info={
+        "owner": pr_info["owner"],
+        "repo": pr_info["repo"],
+        "pr_number": pr_info["pr_number"],
+        "title": pr_data["title"],
+        "sha": pr_data["sha"],
+        "author": pr_data["author"],
+    })
+
+    if pr_data["sha"]:
+        await set_commit_status(
+            pr_info["owner"], pr_info["repo"], pr_data["sha"],
+            state="pending",
+            description="Review Council is analysing this PR...",
+        )
+
+    stage1, stage2, stage3, metadata = await run_full_review(
+        pr_data["diff_text"],
+        repo=pr_info["repo"],
+        pr_title=pr_data["title"],
+        pr_description=pr_data["description"],
+    )
+
+    storage.add_review_result(review_id, pr_data["diff_text"], stage1, stage2, stage3)
+
+    verdict = "✅ Approved"
+    if stage3["response"] and "deny" in stage3["response"].lower():
+        verdict = "❌ Changes Requested"
+    elif stage3["response"] and "changes requested" in stage3["response"].lower():
+        verdict = "⚠️ Changes Requested"
+
+    review_body = f"# Review Council — PR #{pr_info['pr_number']}\n\n{verdict}\n\n---\n\n{stage3['response']}"
+    await post_pr_review(pr_info["owner"], pr_info["repo"], pr_info["pr_number"], review_body)
+
+    if pr_data["sha"]:
+        state = "failure" if "deny" in (stage3.get("response", "") or "").lower() else "success"
+        await set_commit_status(
+            pr_info["owner"], pr_info["repo"], pr_data["sha"],
+            state=state,
+            description="Review Council: review complete",
+        )
+
+
+# ── List open PRs from monitored repos ─────────────────────────────
+
+@app.get("/api/prs")
+async def open_prs():
+    """List open pull requests across monitored repos."""
+    prs = await list_open_prs()
+    return prs
+
+
+# ── Entry point ─────────────────────────────────────────────────────
+
+import os
 
 if __name__ == "__main__":
     import uvicorn

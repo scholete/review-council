@@ -12,7 +12,7 @@ wheels/
 # Keys and secrets
 .env
 
-# Data files
+# Data files (reviews, conversations, etc.)
 data/
 
 # Frontend

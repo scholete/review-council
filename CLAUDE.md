@@ -1,166 +1,193 @@
-# CLAUDE.md - Technical Notes for LLM Council
-
-This file contains technical details, architectural decisions, and important implementation notes for future development sessions.
+# CLAUDE.md — Review Council
 
 ## Project Overview
 
-LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively answer user questions. The key innovation is anonymized peer review in Stage 2, preventing models from playing favorites.
+Review Council is a 3-stage code review system where two AI models (neuralwatt/glm-5.2 and deepseek/deepseek-v4-pro) independently review code diffs, then evaluate each other's reviews, and a chairman synthesises the final answer. Supports both GitHub PRs and pasted diffs. All models are open — no closed provider dependencies.
 
 ## Architecture
 
 ### Backend Structure (`backend/`)
 
 **`config.py`**
-- Contains `COUNCIL_MODELS` (list of OpenRouter model identifiers)
-- Contains `CHAIRMAN_MODEL` (model that synthesizes final answer)
-- Uses environment variable `OPENROUTER_API_KEY` from `.env`
-- Backend runs on **port 8001** (NOT 8000 - user had another app on 8000)
+- `COUNCIL_MODELS` — list of `{"provider", "model"}` dicts
+- `CHAIRMAN_MODEL` — model that synthesises final review
+- `PROVIDER_CONFIGS` — per-provider API key + base URL
+- `GITHUB_TOKEN`, `MONITORED_REPOS` — GitHub integration
+- Environment variables: `NEURALWATT_API_KEY`, `DEEPSEEK_API_KEY`, `GITHUB_TOKEN`
 
-**`openrouter.py`**
-- `query_model()`: Single async model query
-- `query_models_parallel()`: Parallel queries using `asyncio.gather()`
-- Returns dict with 'content' and optional 'reasoning_details'
-- Graceful degradation: returns None on failure, continues with successful responses
+**`llm_client.py`** (replaces old `openrouter.py`)
+- `query_model(model_cfg, messages)` — Single async query via the right provider
+- `query_models_parallel(model_cfgs, messages)` — Parallel queries via `asyncio.gather`
+- Routes to provider-specific OpenAI-compatible endpoints
+- Returns `{"content", "reasoning_details"}` or `None` on failure
 
-**`council.py`** - The Core Logic
-- `stage1_collect_responses()`: Parallel queries to all council models
-- `stage2_collect_rankings()`:
-  - Anonymizes responses as "Response A, B, C, etc."
-  - Creates `label_to_model` mapping for de-anonymization
-  - Prompts models to evaluate and rank (with strict format requirements)
-  - Returns tuple: (rankings_list, label_to_model_dict)
-  - Each ranking includes both raw text and `parsed_ranking` list
-- `stage3_synthesize_final()`: Chairman synthesizes from all responses + rankings
-- `parse_ranking_from_text()`: Extracts "FINAL RANKING:" section, handles both numbered lists and plain format
-- `calculate_aggregate_rankings()`: Computes average rank position across all peer evaluations
+**`council.py`** — The Core Logic
+- `stage1_collect_reviews(diff_text, ...)` — Each model independently reviews the diff
+  - Code-review-specific prompt covering: correctness, security, quality, architecture, performance, testing
+  - Returns list of `{"model", "provider", "response"}`
+- `stage2_collect_rankings(diff_text, stage1_results, ...)` — Anonymised meta-review
+  - Anonymises as "Response A, B, ..."
+  - Creates `label_to_model` mapping
+  - Each model evaluates and ranks the reviews
+  - Returns `(rankings_list, label_to_model_dict)`
+- `stage3_synthesize_final(...)` — Chairman consolidates into final review with verdict
+- `parse_ranking_from_text()` — Extracts FINAL RANKING: section
+- `calculate_aggregate_rankings()` — Average rank across peer evaluations
+- `run_full_review()` — Complete 3-stage pipeline
+- `generate_review_title()` — Short title for review
+
+**`diff_analyzer.py`** — Diff parsing
+- `parse_diff(diff_text)` — Returns list of `DiffFile` objects with hunks
+- `diff_summary(diff_text)` — Human-readable summary (e.g. "3 file(s), +42/-12 lines")
+
+**`github_integration.py`** — GitHub API
+- `parse_pr_url(url)` — Parse PR URL into `(owner, repo, number)`
+- `fetch_pr_diff(owner, repo, number)` — Fetch diff + PR metadata
+- `post_pr_review(owner, repo, number, body)` — Post review comment
+- `set_commit_status(owner, repo, sha, state, description)` — Commit status checks
+- `parse_webhook_payload(body, signature, secret)` — Webhook validation
+- `extract_pr_info_from_webhook(payload)` — Extract PR from webhook event
+- `list_open_prs()` — List open PRs across monitored repos
+
+**`rules/__init__.py`** — Per-repo review guidelines
+- `get_repo_rules(repo)` — Returns rules snippet for Pulse, Stride, Stride-GPU, etc.
+- Injected into Stage 1 prompts to customise reviews per repo
 
 **`storage.py`**
-- JSON-based conversation storage in `data/conversations/`
-- Each conversation: `{id, created_at, messages[]}`
-- Assistant messages contain: `{role, stage1, stage2, stage3}`
-- Note: metadata (label_to_model, aggregate_rankings) is NOT persisted to storage, only returned via API
+- JSON-based review storage in `data/reviews/`
+- Each review: `{id, created_at, title, status, pr, diff_text, messages[]}`
+- Methods: `create_review`, `get_review`, `list_reviews`, `delete_review`, `update_review`, `add_user_message`, `add_review_result`
 
 **`main.py`**
-- FastAPI app with CORS enabled for localhost:5173 and localhost:3000
-- POST `/api/conversations/{id}/message` returns metadata in addition to stages
-- Metadata includes: label_to_model mapping and aggregate_rankings
+- FastAPI app on **port 8001**
+- CORS for localhost:5173 and localhost:3000
+- Endpoints:
+  - `GET /api/reviews` — list reviews
+  - `GET /api/reviews/{id}` — get review detail
+  - `DELETE /api/reviews/{id}` — delete review
+  - `POST /api/review` — submit raw diff for review
+  - `POST /api/review/pr` — submit GitHub PR for review
+  - `POST /api/review/stream` — streamed review with SSE events
+  - `POST /webhooks/github` — webhook receiver for auto-review
+  - `GET /api/prs` — list open PRs from monitored repos
 
 ### Frontend Structure (`frontend/src/`)
 
 **`App.jsx`**
-- Main orchestration: manages conversations list and current conversation
-- Handles message sending and metadata storage
-- Important: metadata is stored in the UI state for display but not persisted to backend JSON
+- Manages reviews list and current review
+- Handles diff submission (streaming) and PR submission (batch)
 
-**`components/ChatInterface.jsx`**
-- Multiline textarea (3 rows, resizable)
-- Enter to send, Shift+Enter for new line
-- User messages wrapped in markdown-content class for padding
+**`api.js`**
+- `listReviews()`, `getReview()`, `deleteReview()`
+- `submitDiff(diffText, repo, ...)` — batch diff submission
+- `submitPr(prUrl)` — batch PR submission
+- `submitDiffStream(..., onEvent)` — SSE streaming
+- `listOpenPrs()` — open PRs from monitored repos
 
-**`components/Stage1.jsx`**
-- Tab view of individual model responses
-- ReactMarkdown rendering with markdown-content wrapper
+**Components:**
+- `Sidebar.jsx` — Review list grouped by repo, repo-colour badges
+- `ReviewInterface.jsx` — Main UI: PR URL input / diff paste + 3-stage display
+- `Stage1.jsx` — Tab view of individual code reviews (per reviewer)
+- `Stage2.jsx` — Tab view of meta-reviews with aggregate rankings
+- `Stage3.jsx` — Final review with verdict badge (✅/⚠️/❌)
 
-**`components/Stage2.jsx`**
-- **Critical Feature**: Tab view showing RAW evaluation text from each model
-- De-anonymization happens CLIENT-SIDE for display (models receive anonymous labels)
-- Shows "Extracted Ranking" below each evaluation so users can validate parsing
-- Aggregate rankings shown with average position and vote count
-- Explanatory text clarifies that boldface model names are for readability only
+### Key Design Decisions
 
-**`components/Stage3.jsx`**
-- Final synthesized answer from chairman
-- Green-tinted background (#f0fff0) to highlight conclusion
+**Provider Architecture**
+- Not using OpenRouter — direct provider calls to NeuralWatt + DeepSeek
+- Each provider has its own API key and base URL
+- Models run in parallel via separate HTTP clients
+- Graceful degradation per model
 
-**Styling (`*.css`)**
-- Light mode theme (not dark mode)
-- Primary color: #4a90e2 (blue)
-- Global markdown styling in `index.css` with `.markdown-content` class
-- 12px padding on all markdown content to prevent cluttered appearance
+**Stage 1 Prompt Focus**
+Code review covers: correctness, security, quality, architecture, performance, testing
+Each issue must include file path + line number
+Ends with a verdict: Approve / Changes Requested / Deny
 
-## Key Design Decisions
+**Stage 2 Meta-Review**
+Same anonymisation pattern as original LLM Council
+Evaluates quality of the reviews, not answers to questions
 
-### Stage 2 Prompt Format
-The Stage 2 prompt is very specific to ensure parseable output:
+**Per-Repo Rules**
+Rules injected into Stage 1 prompt
+Separate guidelines for: Pulse (Python/PHI), Stride (TS/student-data), Stride-GPU (MLX), etc.
+
+**GitHub Integration**
+- PR URL parsing accepts full URLs and shorthand
+- Fetches diff via GitHub REST API
+- Posts review comment + sets commit status
+- Webhook auto-review on `opened`/`synchronize` events
+- Only reviews monitored repos (configurable)
+
+### Data Flow Summary
 ```
-1. Evaluate each response individually first
-2. Provide "FINAL RANKING:" header
-3. Numbered list format: "1. Response C", "2. Response A", etc.
-4. No additional text after ranking section
-```
-
-This strict format allows reliable parsing while still getting thoughtful evaluations.
-
-### De-anonymization Strategy
-- Models receive: "Response A", "Response B", etc.
-- Backend creates mapping: `{"Response A": "openai/gpt-5.1", ...}`
-- Frontend displays model names in **bold** for readability
-- Users see explanation that original evaluation used anonymous labels
-- This prevents bias while maintaining transparency
-
-### Error Handling Philosophy
-- Continue with successful responses if some models fail (graceful degradation)
-- Never fail the entire request due to single model failure
-- Log errors but don't expose to user unless all models fail
-
-### UI/UX Transparency
-- All raw outputs are inspectable via tabs
-- Parsed rankings shown below raw text for validation
-- Users can verify system's interpretation of model outputs
-- This builds trust and allows debugging of edge cases
-
-## Important Implementation Details
-
-### Relative Imports
-All backend modules use relative imports (e.g., `from .config import ...`) not absolute imports. This is critical for Python's module system to work correctly when running as `python -m backend.main`.
-
-### Port Configuration
-- Backend: 8001 (changed from 8000 to avoid conflict)
-- Frontend: 5173 (Vite default)
-- Update both `backend/main.py` and `frontend/src/api.js` if changing
-
-### Markdown Rendering
-All ReactMarkdown components must be wrapped in `<div className="markdown-content">` for proper spacing. This class is defined globally in `index.css`.
-
-### Model Configuration
-Models are hardcoded in `backend/config.py`. Chairman can be same or different from council members. The current default is Gemini as chairman per user preference.
-
-## Common Gotchas
-
-1. **Module Import Errors**: Always run backend as `python -m backend.main` from project root, not from backend directory
-2. **CORS Issues**: Frontend must match allowed origins in `main.py` CORS middleware
-3. **Ranking Parse Failures**: If models don't follow format, fallback regex extracts any "Response X" patterns in order
-4. **Missing Metadata**: Metadata is ephemeral (not persisted), only available in API responses
-
-## Future Enhancement Ideas
-
-- Configurable council/chairman via UI instead of config file
-- Streaming responses instead of batch loading
-- Export conversations to markdown/PDF
-- Model performance analytics over time
-- Custom ranking criteria (not just accuracy/insight)
-- Support for reasoning models (o1, etc.) with special handling
-
-## Testing Notes
-
-Use `test_openrouter.py` to verify API connectivity and test different model identifiers before adding to council. The script tests both streaming and non-streaming modes.
-
-## Data Flow Summary
-
-```
-User Query
+PR opened / updated
+    ↓  (GitHub Action trigger: .github/workflows/review-council.yml)
+review.py fetches diff via GH API
     ↓
-Stage 1: Parallel queries → [individual responses]
+Stage 1: Parallel review by glm-5.2 + deepseek-v4-pro
     ↓
-Stage 2: Anonymize → Parallel ranking queries → [evaluations + parsed rankings]
+Stage 2: Anonymised → Parallel meta-review → rankings
     ↓
-Aggregate Rankings Calculation → [sorted by avg position]
+Aggregate Rankings
     ↓
-Stage 3: Chairman synthesis with full context
+Stage 3: Chairman synthesis with verdict
     ↓
-Return: {stage1, stage2, stage3, metadata}
-    ↓
-Frontend: Display with tabs + validation UI
+PR comment posted + commit status set (success/failure)
 ```
 
-The entire flow is async/parallel where possible to minimize latency.
+### Important Implementation Details
+
+**Dual-Mode Architecture**
+The council runs in two modes:
+
+1. **GitHub Action (production)** — `review.py` is the entry point. Runs on every PR via `.github/workflows/review-council.yml`. No server, no frontend. Posts results as PR comments + commit status checks. Deps: `httpx`, `python-dotenv`. Secrets stored in GH repo settings.
+
+2. **Local dev (optional)** — `backend/main.py` via FastAPI + React frontend. Used for prompt debugging, testing rules, local experiments. Run with `./start.sh`.
+
+**`review.py`** — GitHub Action entry point (repo root)
+- Reads env vars set by workflow: `PR_NUMBER`, `PR_TITLE`, `PR_BODY`, `REPO`, `SHA`, `GITHUB_TOKEN`, `NEURALWATT_API_KEY`, `DEEPSEEK_API_KEY`
+- Inserts repo root into `sys.path` to import `backend.*` modules
+- Falls back to `list_open_prs()` if no `PR_NUMBER` is provided
+- Posts review to PR via `post_pr_review()`
+- Sets commit status via `set_commit_status()`
+- `_post_failure_comment()` — synchronous fallback using `httpx.Client()`
+
+**`.github/workflows/review-council.yml`**
+- Trigger: `pull_request: [opened, synchronize, reopened]`
+- Concurrency group per PR — newer commits cancel in-progress reviews
+- Timeout: 10 minutes
+- Steps: checkout (fetch-depth: 0) → setup Python 3.10 → pip install httpx python-dotenv → run review.py
+- Env vars passed from `github.event` context + repo secrets
+
+**Relative Imports**
+All backend modules use relative imports (`from .config import ...`). Run as `python -m backend.main`.
+
+**Port Configuration**
+- Backend: 8001
+- Frontend: 5173
+
+**Model Config Format**
+```python
+COUNCIL_MODELS = [
+    {"provider": "neuralwatt", "model": "glm-5.2"},
+    {"provider": "deepseek", "model": "deepseek-v4-pro"},
+]
+```
+
+**Error Handling**
+- Graceful degradation per model (returns None, continues)
+- Never fail entire request due to single model failure
+- Failed reviews get `status: "failed"` in storage
+- 502 on GitHub fetch failure, 400 on bad PR URL
+
+### Common Gotchas
+
+1. **API Keys**: Must set `NEURALWATT_API_KEY` and `DEEPSEEK_API_KEY` as repo secrets in GitHub. Without them, the providers raise `ValueError` at query time.
+2. **Action secrets, not env vars**: The workflow uses `${{ secrets.NEURALWATT_API_KEY }}` — these must be configured under Settings → Secrets and variables → Actions, not in .env.
+3. **No .env in Action**: `python-dotenv` loads `.env` which doesn't exist in CI. That's fine — `load_dotenv()` is a no-op when the file is missing, and the Action sets env vars directly.
+4. **Python 3.10+ required**: The Action uses `python-version: "3.10"`, but the code runs on 3.10–3.13.
+5. **Module Import Errors**: Run `python review.py` or `python -m backend.main` from project root.
+6. **Port Configuration**: Local dev only — backend: 8001, frontend: 5173.
+7. **CORS**: Frontend origins must match `main.py` CORS middleware (local dev only).
+8. **Data Directory**: `data/reviews/` is gitignored — auto-created on first use.

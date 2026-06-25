@@ -1,8 +1,8 @@
-"""JSON-based storage for conversations."""
+"""JSON-based storage for reviews and PR metadata."""
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from .config import DATA_DIR
@@ -13,160 +13,137 @@ def ensure_data_dir():
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
 
-def get_conversation_path(conversation_id: str) -> str:
-    """Get the file path for a conversation."""
-    return os.path.join(DATA_DIR, f"{conversation_id}.json")
+def _path(review_id: str) -> str:
+    return os.path.join(DATA_DIR, f"{review_id}.json")
 
 
-def create_conversation(conversation_id: str) -> Dict[str, Any]:
-    """
-    Create a new conversation.
+# ── CRUD ────────────────────────────────────────────────────────────
+
+def create_review(review_id: str, pr_info: Optional[Dict] = None) -> Dict[str, Any]:
+    """Create a new review record.
 
     Args:
-        conversation_id: Unique identifier for the conversation
+        review_id: Unique identifier.
+        pr_info:   Optional dict with ``owner``, ``repo``, ``pr_number``,
+                   ``title``, ``sha``, ``author``.
 
     Returns:
-        New conversation dict
+        The new review dict.
     """
     ensure_data_dir()
-
-    conversation = {
-        "id": conversation_id,
-        "created_at": datetime.utcnow().isoformat(),
-        "title": "New Conversation",
-        "messages": []
+    review = {
+        "id": review_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "title": "Code Review",
+        "status": "pending",  # pending | in_progress | completed | failed
+        "pr": pr_info or {},
+        "diff_text": "",
+        "messages": [],
     }
-
-    # Save to file
-    path = get_conversation_path(conversation_id)
-    with open(path, 'w') as f:
-        json.dump(conversation, f, indent=2)
-
-    return conversation
+    _save(review)
+    return review
 
 
-def get_conversation(conversation_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Load a conversation from storage.
-
-    Args:
-        conversation_id: Unique identifier for the conversation
-
-    Returns:
-        Conversation dict or None if not found
-    """
-    path = get_conversation_path(conversation_id)
-
+def get_review(review_id: str) -> Optional[Dict[str, Any]]:
+    """Load a review from storage."""
+    path = _path(review_id)
     if not os.path.exists(path):
         return None
-
-    with open(path, 'r') as f:
+    with open(path) as f:
         return json.load(f)
 
 
-def save_conversation(conversation: Dict[str, Any]):
-    """
-    Save a conversation to storage.
+def _save(review: Dict[str, Any]):
+    path = _path(review["id"])
+    with open(path, "w") as f:
+        json.dump(review, f, indent=2)
 
-    Args:
-        conversation: Conversation dict to save
-    """
+
+def list_reviews() -> List[Dict[str, Any]]:
+    """List all reviews (metadata only), newest first."""
     ensure_data_dir()
-
-    path = get_conversation_path(conversation['id'])
-    with open(path, 'w') as f:
-        json.dump(conversation, f, indent=2)
-
-
-def list_conversations() -> List[Dict[str, Any]]:
-    """
-    List all conversations (metadata only).
-
-    Returns:
-        List of conversation metadata dicts
-    """
-    ensure_data_dir()
-
-    conversations = []
+    reviews = []
     for filename in os.listdir(DATA_DIR):
-        if filename.endswith('.json'):
-            path = os.path.join(DATA_DIR, filename)
-            with open(path, 'r') as f:
-                data = json.load(f)
-                # Return metadata only
-                conversations.append({
-                    "id": data["id"],
-                    "created_at": data["created_at"],
-                    "title": data.get("title", "New Conversation"),
-                    "message_count": len(data["messages"])
-                })
+        if not filename.endswith(".json"):
+            continue
+        with open(os.path.join(DATA_DIR, filename)) as f:
+            data = json.load(f)
+        pr = data.get("pr", {})
+        reviews.append({
+            "id": data["id"],
+            "created_at": data["created_at"],
+            "title": data.get("title", "Code Review"),
+            "status": data.get("status", "unknown"),
+            "repo": pr.get("repo", ""),
+            "pr_number": pr.get("pr_number"),
+            "pr_title": pr.get("title", ""),
+            "message_count": len(data.get("messages", [])),
+        })
+    reviews.sort(key=lambda x: x["created_at"], reverse=True)
+    return reviews
 
-    # Sort by creation time, newest first
-    conversations.sort(key=lambda x: x["created_at"], reverse=True)
 
-    return conversations
+def delete_review(review_id: str) -> bool:
+    """Delete a review record."""
+    path = _path(review_id)
+    if not os.path.exists(path):
+        return False
+    os.remove(path)
+    return True
 
 
-def add_user_message(conversation_id: str, content: str):
+# ── Mutations ───────────────────────────────────────────────────────
+
+def update_review(
+    review_id: str,
+    **kwargs,
+):
+    """Update one or more fields on a review record.
+
+    Accepts: ``title``, ``status``, ``diff_text``, ``pr``.
     """
-    Add a user message to a conversation.
+    review = get_review(review_id)
+    if review is None:
+        raise ValueError(f"Review {review_id} not found")
+    review.update(kwargs)
+    _save(review)
 
-    Args:
-        conversation_id: Conversation identifier
-        content: User message content
-    """
-    conversation = get_conversation(conversation_id)
-    if conversation is None:
-        raise ValueError(f"Conversation {conversation_id} not found")
 
-    conversation["messages"].append({
+def add_user_message(review_id: str, content: str):
+    """Append a user message."""
+    review = get_review(review_id)
+    if review is None:
+        raise ValueError(f"Review {review_id} not found")
+    review["messages"].append({
         "role": "user",
-        "content": content
+        "content": content,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     })
+    _save(review)
 
-    save_conversation(conversation)
 
-
-def add_assistant_message(
-    conversation_id: str,
+def add_review_result(
+    review_id: str,
+    diff_text: str,
     stage1: List[Dict[str, Any]],
     stage2: List[Dict[str, Any]],
-    stage3: Dict[str, Any]
+    stage3: Dict[str, Any],
 ):
-    """
-    Add an assistant message with all 3 stages to a conversation.
+    """Append a review result (replaces the old assistant message approach).
 
-    Args:
-        conversation_id: Conversation identifier
-        stage1: List of individual model responses
-        stage2: List of model rankings
-        stage3: Final synthesized response
+    Stores the full 3-stage output plus the original diff so each
+    review record is self-contained.
     """
-    conversation = get_conversation(conversation_id)
-    if conversation is None:
-        raise ValueError(f"Conversation {conversation_id} not found")
-
-    conversation["messages"].append({
+    review = get_review(review_id)
+    if review is None:
+        raise ValueError(f"Review {review_id} not found")
+    review["diff_text"] = diff_text
+    review["status"] = "completed" if stage3.get("response") else "failed"
+    review["messages"].append({
         "role": "assistant",
         "stage1": stage1,
         "stage2": stage2,
-        "stage3": stage3
+        "stage3": stage3,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     })
-
-    save_conversation(conversation)
-
-
-def update_conversation_title(conversation_id: str, title: str):
-    """
-    Update the title of a conversation.
-
-    Args:
-        conversation_id: Conversation identifier
-        title: New title for the conversation
-    """
-    conversation = get_conversation(conversation_id)
-    if conversation is None:
-        raise ValueError(f"Conversation {conversation_id} not found")
-
-    conversation["title"] = title
-    save_conversation(conversation)
+    _save(review)
