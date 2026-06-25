@@ -71,7 +71,8 @@ async def query_model(
             }
 
     except Exception as e:
-        print(f"[llm_client] Error querying {model_name} @ {base_url}: {e}")
+        err_msg = str(e) or f"{type(e).__name__} (no message)"
+        print(f"[llm_client] Error querying {model_name} @ {base_url}: {err_msg}")
         return None
 
 
@@ -89,8 +90,6 @@ async def query_models_parallel(
         ``{model_name: response_or_None, ...}``
     """
     import asyncio
-
-    tasks = [query_model(cfg, messages) for cfg in model_cfgs]
 
     # Each model gets a separate HTTP client session so they're
     # truly parallel even when pointing at different base URLs.
