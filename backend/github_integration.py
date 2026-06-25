@@ -86,6 +86,7 @@ async def fetch_pr_diff(
         )
         if resp.status_code != 200:
             print(f"[github] Failed to fetch PR metadata: {resp.status_code}")
+            print(f"[github] Response: {resp.text[:500]}")
             return None
 
         pr_data = resp.json()
@@ -191,7 +192,7 @@ async def set_commit_status(
             json=payload,
         )
         if resp.status_code not in (200, 201):
-            print(f"[github] Failed to set status: {resp.status_code}")
+            print(f"[github] Failed to set status: {resp.status_code} {resp.text[:300]}")
             return False
         return True
 
