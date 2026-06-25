@@ -213,12 +213,27 @@ async def _review_single_pr(
         if stage3.get("response") is None:
             state = "failure"
             desc = "Review Council: synthesis failed"
-        elif "deny" in (stage3.get("response") or "").lower():
-            state = "failure"
-            desc = "Review Council: changes requested"
         else:
-            state = "success"
-            desc = "Review Council: review complete"
+            # Read the verdict from the review body itself
+            lower = review_body.lower()
+            if "✅ approved" in lower:
+                state = "success"
+                desc = "Review Council: approved"
+            elif "❌ denied" in lower:
+                state = "failure"
+                desc = "Review Council: denied"
+            elif "⚠️ changes requested" in lower:
+                state = "failure"
+                desc = "Review Council: changes requested"
+            else:
+                # Fallback — search the response text for keywords
+                resp_lower = (stage3.get("response") or "").lower()
+                if "approve" in resp_lower[:300]:
+                    state = "success"
+                    desc = "Review Council: approved"
+                else:
+                    state = "failure"
+                    desc = "Review Council: changes requested"
         await set_commit_status(owner, repo, sha, state=state, description=desc)
         print(f"   ✓ Commit status set: {state}")
 
