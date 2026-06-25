@@ -90,7 +90,7 @@ async def main():
         _die(f"REPO must be 'owner/repo', got: {repo_full}")
     owner, repo_name = repo_full.split("/", 1)
 
-    await _review_single_pr(
+    ok = await _review_single_pr(
         owner=owner,
         repo=repo_name,
         pr_number=int(pr_number),
@@ -99,6 +99,8 @@ async def main():
         sha=sha,
         token=token,
     )
+    if not ok:
+        sys.exit(1)
 
 
 async def _review_single_pr(
@@ -110,7 +112,11 @@ async def _review_single_pr(
     pr_description: str = "",
     sha: str = "",
     token: str = "",
-):
+) -> bool:
+    """Run the full 3-stage review on a single PR.
+
+    Returns ``True`` on success, ``False`` on failure.
+    """
     print(f"\n{'='*60}")
     print(f"🚀 Reviewing: {owner}/{repo} #{pr_number} — {pr_title}")
     print(f"{'='*60}")
@@ -120,7 +126,10 @@ async def _review_single_pr(
     pr_data = await fetch_pr_diff(owner, repo, pr_number)
     if pr_data is None:
         print(f"❌ Failed to fetch PR #{pr_number} from {owner}/{repo}")
-        return
+        if sha:
+            await set_commit_status(owner, repo, sha, state="failure",
+                                    description="Review Council: unable to fetch PR diff (check token permissions)")
+        return False
 
     diff_text = pr_data["diff_text"]
     sha = sha or pr_data.get("sha", "")
@@ -149,7 +158,7 @@ async def _review_single_pr(
         if sha:
             await set_commit_status(owner, repo, sha, state="failure",
                                     description="Review Council: models unavailable")
-        return
+        return False
 
     print(f"   ✓ {len(stage1)} review(s) collected")
 
@@ -214,6 +223,7 @@ async def _review_single_pr(
         print(f"   ✓ Commit status set: {state}")
 
     print(f"✅ Done — {owner}/{repo} #{pr_number}\n")
+    return True
 
 
 def _post_failure_comment(owner: str, repo: str, pr_number: int, message: str):
