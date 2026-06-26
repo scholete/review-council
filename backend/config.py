@@ -28,7 +28,7 @@ COUNCIL_MODELS = [
 ]
 
 # Chairman — synthesises the final review from stage 1 & 2 outputs.
-CHAIRMAN_MODEL = {"provider": "neuralwatt", "model": "glm-5.2"}
+CHAIRMAN_MODEL = {"provider": "deepseek", "model": "deepseek-v4-pro"}
 
 # ── GitHub Integration ─────────────────────────────────────────────
 
