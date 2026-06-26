@@ -182,17 +182,28 @@ async def _review_single_pr(
     if stage3.get("response") is None:
         verdict = "❌ Error — no synthesis produced"
     else:
-        # Search the full response (not just first 500 chars) for verdict markers
-        lower = stage3["response"].lower()
-        # Check for denial/changes markers first — Approve is the default
-        if "❌" in stage3["response"] and "deny" in lower:
+        # The chairman's prompt says to default to Approve and only use
+        # Changes Requested for Critical/High issues. Check for explicit
+        # denial/changes markers in the Verdict section only (last ~500 chars).
+        response_text = stage3["response"]
+        # Extract just the verdict section (everything after the last "## Verdict")
+        verdict_section = ""
+        marker = "## Verdict"
+        idx = response_text.lower().rfind(marker.lower())
+        if idx >= 0:
+            verdict_section = response_text[idx:]
+        else:
+            verdict_section = response_text[-500:]
+
+        lower = verdict_section.lower()
+        if "❌" in verdict_section and ("deny" in lower or "denied" in lower):
             verdict = "❌ Denied"
-        elif "⚠️" in stage3["response"] and "changes" in lower:
+        elif "⚠️" in verdict_section and "changes requested" in lower:
             verdict = "⚠️ Changes Requested"
-        elif "deny" in lower:
+        elif "deny" in lower and "approve" not in lower:
             verdict = "❌ Denied"
-        elif "changes requested" in lower:
-            verdict = "⚠️ Changes Requested"
+        # Default: ✅ Approved (no need to check further — the chairman was
+        # instructed to default to Approve unless Critical/High issues exist)
 
     review_body = f"""# Review Council — {owner}/{repo} #{pr_number}
 

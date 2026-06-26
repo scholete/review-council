@@ -47,7 +47,7 @@ async def stage1_collect_reviews(
     """
     formatted_diff = _format_diff_for_prompt(diff_text, repo, pr_title)
 
-    review_prompt = f"""You are a senior engineer performing a thorough code review.
+    review_prompt = f"""You are a senior engineer performing a focused code review.
 
 Context:
 {"  Repository: " + repo if repo else ""}
@@ -58,21 +58,31 @@ Below is the code diff to review:
 
 {formatted_diff}
 
-Please provide a structured review covering these areas:
+Focus ONLY on the files actually changed in this diff and their direct dependencies.
+Do NOT review unrelated files, speculate about code you cannot see, or flag
+hypothetical scenarios. Only flag issues in the changed code.
+
+Review these areas:
 
 1. **Summary** — What does this change do in a sentence?
-2. **Correctness** — Any bugs, logic errors, or edge cases missed?
-3. **Security** — Injection risks, data leaks, auth/authorisation issues?
+2. **Correctness** — Any bugs, logic errors, or edge cases missed in the changed code?
+3. **Security** — Injection risks, data leaks, auth/authorisation issues in the changed code?
 4. **Code Quality** — Readability, maintainability, follows language/framework conventions?
 5. **Architecture** — Coupling, separation of concerns, API design?
 6. **Performance** — N+1 queries, unnecessary allocations, caching opportunities?
 7. **Testing** — Are tests included? What scenarios are missing?
-8. **Nitpicks** — Minor style issues, naming, comments.
 
-For every issue found, include the **file path** and **line number**.
-Be specific and actionable — "this is wrong" is less useful than "this will crash when X is empty".
+Do NOT include:
+- Nitpicks, minor style issues, naming, or comments
+- Issues in files not touched by this diff
+- Hypothetical scenarios that "could" happen but won't
 
-End with a **verdict**: ✅ Approve | ⚠️ Changes Requested | ❌ Deny"""
+Be specific and actionable with file paths and line numbers.
+If the changed code is correct, say so explicitly.
+
+End with a **verdict**: ✅ Approve | ⚠️ Changes Requested | ❌ Deny
+
+IMPORTANT: Only use ⚠️ Changes Requested if there is at least one Critical or High Priority issue directly in the changed code that will cause incorrect behavior in production. Missing tests, style suggestions, and architecture improvements are NOT blockers — mention them but default to ✅ Approve."""
 
     messages = [{"role": "user", "content": review_prompt}]
 
@@ -221,8 +231,11 @@ STAGE 1 — Individual Reviews:
 STAGE 2 — Peer Evaluations of Reviews:
 {stage2_text}
 
-Your task as Chairman is to synthesise all of this into a **single, consolidated, actionable code review**. Consider:
+Your task as Chairman is to synthesise all of this into a **single, consolidated, actionable code review**.
 
+Focus ONLY on the files actually changed in this diff. Do not speculate about code not visible in the diff.
+
+Consider:
 - The issues caught by each reviewer and their severity
 - The peer evaluations — which reviews were most thorough
 - Areas of agreement (high-confidence issues) vs disagreement
@@ -235,18 +248,35 @@ Format your final review as:
 
 ## Critical Issues
 (file:line — description)
+Only REAL bugs, security vulnerabilities, or data corruption risks in the changed code.
+Leave empty if none.
 
 ## High Priority
 (file:line — description)
+Only missing auth/ownership checks, null guards, or incorrect data flow in the changed logic.
+Leave empty if none.
 
-## Medium / Low
-(file:line — description)
+## Code Quality & Architecture
+(readability, maintainability, coupling, API design — non-blocking observations)
+
+## Performance
+(N+1 queries, allocations, caching — non-blocking observations)
+
+## Testing
+(are tests included? what's missing? — non-blocking)
 
 ## Positive Highlights
 (what the PR does well)
 
 ## Verdict
-✅ Approve | ⚠️ Changes Requested | ❌ Deny"""
+✅ Approve | ⚠️ Changes Requested | ❌ Deny
+
+CRITICAL RULE: Default to ✅ Approve. Only use ⚠️ Changes Requested if there is at least one Critical or High Priority issue that will cause incorrect behavior in production. Do NOT request changes for:
+- Style, naming, formatting, nitpicks
+- Missing tests (mention in Testing section instead)
+- Architecture suggestions or follow-up tickets
+- Hypothetical edge cases
+- Issues in files not touched by this diff"""
 
     messages = [{"role": "user", "content": chairman_prompt}]
 
