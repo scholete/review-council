@@ -285,7 +285,7 @@ CRITICAL RULE: Default to ✅ Approve. Only use ⚠️ Changes Requested if ther
         return {
             "model": CHAIRMAN_MODEL["model"],
             "provider": CHAIRMAN_MODEL["provider"],
-            "response": "Error: Unable to generate final synthesis.",
+            "response": None,
         }
 
     return {
