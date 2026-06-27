@@ -23,7 +23,7 @@ PROVIDER_CONFIGS = {
 # Each entry specifies the provider and the model identifier to use.
 
 COUNCIL_MODELS = [
-    {"provider": "neuralwatt", "model": "glm-5.2"},
+    {"provider": "neuralwatt", "model": "glm-5.2-short-fast"},
     {"provider": "deepseek", "model": "deepseek-v4-pro"},
 ]
 

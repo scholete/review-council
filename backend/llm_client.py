@@ -12,7 +12,7 @@ from .config import PROVIDER_CONFIGS
 
 def _pick_provider(model_cfg: dict) -> tuple:
     """Return (api_key, base_url) for a model config dict like
-    ``{"provider": "neuralwatt", "model": "glm-5.2"}``."""
+    {"provider": "neuralwatt", "model": "glm-5.2-short-fast"}."""
     provider_name = model_cfg["provider"]
     cfg = PROVIDER_CONFIGS.get(provider_name)
     if cfg is None:
