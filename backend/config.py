@@ -23,12 +23,12 @@ PROVIDER_CONFIGS = {
 # Each entry specifies the provider and the model identifier to use.
 
 COUNCIL_MODELS = [
-    {"provider": "neuralwatt", "model": "glm-5.2-short-fast"},
+    {"provider": "neuralwatt", "model": "glm-5.2-short-fast-flex"},
     {"provider": "deepseek", "model": "deepseek-v4-pro"},
 ]
 
 # Chairman — synthesises the final review from stage 1 & 2 outputs.
-CHAIRMAN_MODEL = {"provider": "neuralwatt", "model": "glm-5.2-short"}
+CHAIRMAN_MODEL = {"provider": "neuralwatt", "model": "glm-5.2-short-flex"}
 
 # ── GitHub Integration ─────────────────────────────────────────────
 
