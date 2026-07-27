@@ -62,6 +62,23 @@ Focus ONLY on the files actually changed in this diff and their direct dependenc
 Do NOT review unrelated files, speculate about code you cannot see, or flag
 hypothetical scenarios. Only flag issues in the changed code.
 
+CRITICAL — Factual Claims About Unseen Code:
+You do NOT have access to the full codebase — only this diff. Any statement about
+code NOT present in this diff (e.g. "nothing reads from X", "this pattern isn't
+used elsewhere", "no tests exist for Y", "the import is unused") is UNVERIFIED.
+
+When you make such a claim:
+1. PREFIX it with "⚠️ Unverified:" and state it as a CHECK, not a fact.
+2. Provide the EXACT verification command to run (grep, node --check, rg, etc.).
+3. State: how to confirm, and what the consequence is if the claim is wrong.
+
+Example of what NOT to do:
+  ❌ "Nothing in the app reads from PostgREST — this endpoint is dead code."
+Example of what TO do:
+  ✅ "⚠️ Unverified: Check if anything reads from PostgREST with:
+     `rg -l 'postgrest' --type ts`
+     If no results, this endpoint is dead code. If results exist, ignore this."
+
 Review these areas:
 
 1. **Summary** — What does this change do in a sentence?
@@ -241,6 +258,20 @@ Consider:
 - Areas of agreement (high-confidence issues) vs disagreement
 - Anything important that ALL reviewers missed
 
+UNVERIFIED CLAIMS AUDIT:
+Reviewers do NOT have access to the full codebase — only the diff. Any claim a
+reviewer made about code not visible in the diff (marked "⚠️ Unverified") is
+NOT a confirmed issue — it's a hypothesis that needs manual verification.
+
+Your job:
+1. Identify EVERY unverified factual claim made by the reviewers.
+2. If the claim, if true, would change the verdict, state it explicitly:
+   "⚠️ Needs Verification: [the claim + the command to verify it]"
+3. If the claim, even if true, would NOT change the verdict, note it as a
+   follow-up suggestion — not a blocker.
+4. NEVER let an unverified claim be the sole basis for ⚠️ Changes Requested or ❌ Deny.
+   Only confirmed issues visible in the diff itself can change the verdict.
+
 Format your final review as:
 
 ## Summary
@@ -267,6 +298,11 @@ Leave empty if none.
 
 ## Positive Highlights
 (what the PR does well)
+
+## Unverified Claims
+(⚠️ claims reviewers made about code not in this diff — list each with the exact
+verification command. These are NOT confirmed issues. Only list claims that would
+matter if true.)
 
 ## Verdict
 ✅ Approve | ⚠️ Changes Requested | ❌ Deny
