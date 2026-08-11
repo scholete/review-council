@@ -9,7 +9,7 @@ An LLM-powered **code review council** for Scholete's repositories. Runs as a **
 ```
 PR opened / updated
     ↓  (GitHub Action trigger)
-Stage 1: Two independent reviews (glm-5.2 + deepseek-v4-pro)
+Stage 1: Two independent reviews (glm-5.2 + deepseek-v4-flash)
     ↓
 Stage 2: Each model evaluates the other's review (anonymised meta-review)
     ↓
@@ -95,7 +95,7 @@ This is not needed for production — the Action handles everything.
 | Model | Provider | Role |
 |-------|----------|------|
 | `glm-5.2` | NeuralWatt | Council member + Chairman |
-| `deepseek-v4-pro` | DeepSeek | Council member |
+| `deepseek-v4-flash` | DeepSeek | Council member |
 
 ## Tech Stack
 

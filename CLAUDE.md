@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Review Council is a 3-stage code review system where two AI models (neuralwatt/glm-5.2 and deepseek/deepseek-v4-pro) independently review code diffs, then evaluate each other's reviews, and a chairman synthesises the final answer. Supports both GitHub PRs and pasted diffs. All models are open — no closed provider dependencies.
+Review Council is a 3-stage code review system where two AI models (neuralwatt/glm-5.2 and deepseek/deepseek-v4-flash) independently review code diffs, then evaluate each other's reviews, and a chairman synthesises the final answer. Supports both GitHub PRs and pasted diffs. All models are open — no closed provider dependencies.
 
 ## Architecture
 
@@ -125,7 +125,7 @@ PR opened / updated
     ↓  (GitHub Action trigger: .github/workflows/review-council.yml)
 review.py fetches diff via GH API
     ↓
-Stage 1: Parallel review by glm-5.2 + deepseek-v4-pro
+Stage 1: Parallel review by glm-5.2 + deepseek-v4-flash
     ↓
 Stage 2: Anonymised → Parallel meta-review → rankings
     ↓
@@ -171,7 +171,7 @@ All backend modules use relative imports (`from .config import ...`). Run as `py
 ```python
 COUNCIL_MODELS = [
     {"provider": "neuralwatt", "model": "glm-5.2"},
-    {"provider": "deepseek", "model": "deepseek-v4-pro"},
+    {"provider": "deepseek", "model": "deepseek-v4-flash"},
 ]
 ```
 

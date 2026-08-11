@@ -24,7 +24,7 @@ PROVIDER_CONFIGS = {
 
 COUNCIL_MODELS = [
     {"provider": "neuralwatt", "model": "glm-5.2-short-fast-flex"},
-    {"provider": "deepseek", "model": "deepseek-v4-pro"},
+    {"provider": "deepseek", "model": "deepseek-v4-flash"},
 ]
 
 # Chairman — synthesises the final review from stage 1 & 2 outputs.
@@ -45,4 +45,4 @@ DATA_DIR = os.getenv("DATA_DIR", "data/reviews")
 
 # ── Title generation model (fast + cheap) ─────────────────────────
 
-TITLE_MODEL = {"provider": "deepseek", "model": "deepseek-v4-pro"}
+TITLE_MODEL = {"provider": "deepseek", "model": "deepseek-v4-flash"}
