@@ -7,12 +7,57 @@ and handles incoming webhooks.
 import re
 import hmac
 import json
+import asyncio
+import shutil
+import subprocess
+import tempfile
 from hashlib import sha256
 from typing import Optional, Dict, Any, List
 
 import httpx
 
 from .config import GITHUB_TOKEN, MONITORED_REPOS
+
+
+def _fetch_diff_via_git(
+    owner: str, repo: str, pr_number: int, base_ref: str,
+) -> Optional[str]:
+    """Git-protocol diff fallback for PRs whose diff exceeds the API limit.
+
+    Clones the repo (blob:none, no checkout), fetches the PR head and the
+    base branch, and emits base...head. Returns None on any failure.
+    Authenticates with the Actions GITHUB_TOKEN (private repos; the token
+    is scoped to the calling repo, so same-org private repos work).
+    """
+    url = f"https://github.com/{owner}/{repo}.git"
+    if GITHUB_TOKEN:
+        url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{owner}/{repo}.git"
+    tmp = tempfile.mkdtemp(prefix="rc-gitdiff-")
+    try:
+        subprocess.run(
+            ["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout",
+             url, tmp],
+            check=True, capture_output=True, timeout=300,
+        )
+        subprocess.run(
+            ["git", "-C", tmp, "fetch", "--quiet", "origin",
+             f"pull/{pr_number}/head:pr"],
+            check=True, capture_output=True, timeout=300,
+        )
+        subprocess.run(
+            ["git", "-C", tmp, "fetch", "--quiet", "origin", base_ref],
+            check=True, capture_output=True, timeout=300,
+        )
+        out = subprocess.run(
+            ["git", "-C", tmp, "diff", f"origin/{base_ref}...pr"],
+            capture_output=True, text=True, timeout=300,
+        )
+        return out.stdout or None
+    except Exception as exc:  # noqa: BLE001 — fallback must never crash the review
+        print(f"[github] git diff fallback failed: {exc}")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -91,17 +136,32 @@ async def fetch_pr_diff(
 
         pr_data = resp.json()
 
-        # Get the diff text
+        # Get the diff text. GitHub's API REFUSES diffs over its size limit
+        # (406 "unable to load diff" on large PRs); the git protocol has no
+        # such limit, so fall back to a local base...head diff.
+        diff_text = None
         diff_resp = await client.get(
             f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
             headers=_headers(),
         )
-        if diff_resp.status_code != 200:
+        if diff_resp.status_code == 200:
+            diff_text = diff_resp.text
+        else:
+            print(
+                f"[github] API diff fetch failed ({diff_resp.status_code}) — "
+                f"falling back to the git protocol"
+            )
+            diff_text = await asyncio.to_thread(
+                _fetch_diff_via_git,
+                owner, repo, pr_number,
+                (pr_data.get("base") or {}).get("ref", "main"),
+            )
+        if not diff_text:
             print(f"[github] Failed to fetch PR diff: {diff_resp.status_code}")
             return None
 
         return {
-            "diff_text": diff_resp.text,
+            "diff_text": diff_text,
             "title": pr_data.get("title", ""),
             "description": pr_data.get("body", "") or "",
             "sha": pr_data.get("head", {}).get("sha", ""),

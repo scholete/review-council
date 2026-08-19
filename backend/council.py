@@ -12,16 +12,40 @@ from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, TITLE_MODEL
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
+# The review window: diffs beyond this are truncated with a banner so a
+# mega-PR (thousands of files) cannot blow the models context window.
+MAX_DIFF_LINES = 6000
+
+# Markdown code-fence for the diff block (chr(96) = backtick).
+_FENCE = chr(96) * 3
+
+
 def _format_diff_for_prompt(diff_text: str, repo: str = "", pr_title: str = "") -> str:
-    """Wrap a raw diff into a readable block prefixed with context."""
+    """Wrap a raw diff into a readable block prefixed with context.
+
+    Diffs larger than MAX_DIFF_LINES are truncated to the window with an
+    explicit banner, so the council reviews the head of the diff and knows
+    the rest exists (it must not speculate about unseen lines).
+    """
     parts = []
     if repo:
         parts.append(f"Repository: {repo}")
     if pr_title:
         parts.append(f"PR Title: {pr_title}")
-    parts.append("```diff")
-    parts.append(diff_text)
-    parts.append("```")
+    lines = diff_text.splitlines()
+    shown = lines
+    omitted = 0
+    if len(lines) > MAX_DIFF_LINES:
+        shown = lines[:MAX_DIFF_LINES]
+        omitted = len(lines) - MAX_DIFF_LINES
+    parts.append(_FENCE + "diff")
+    parts.extend(shown)
+    if omitted:
+        parts.append(
+            f"[diff truncated: {omitted} lines omitted — the diff exceeds the "
+            f"review window; review only the shown portion and say so]"
+        )
+    parts.append(_FENCE)
     return "\n".join(parts)
 
 
